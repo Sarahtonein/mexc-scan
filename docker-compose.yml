@@ -7,10 +7,15 @@ services:
     volumes:
       - ./tracked_tokens.json:/app/tracked_tokens.json
     restart: unless-stopped
+
     environment:
       - PYTHONUNBUFFERED=1
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+      - POST_URL=${POST_URL}
+
     ports:
       - "8080:80"
+
     networks:
       - token-network
 
