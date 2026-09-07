@@ -168,7 +168,7 @@ def send_discord_start_notification(
             f"**Token:** `{token_name}`\n"
             f"**Initial Price:** `{initial_price}`\n"
             f"**Created:** `{create_time.isoformat()}`\n\n"
-            f"🔗 {token_link}\n\n"
+            f"🔗 <{token_link}>\n\n"
             f"⏱️ Tracking for 8 hours..."
         )
     }
