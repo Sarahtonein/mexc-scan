@@ -11,6 +11,26 @@ POST_URL = os.getenv("POST_URL")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 TRACKED_TOKENS_FILE = "tracked_tokens.json"
+AEST = timezone(timedelta(hours=10))
+
+
+def is_stock_symbol(symbol):
+    if not isinstance(symbol, str):
+        return False
+    return "STOCK" in symbol.upper()
+
+
+def format_aest_time(value):
+    if value is None:
+        return "Unknown"
+
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(AEST).strftime("%Y-%m-%d %H:%M:%S AEST")
 
 
 def load_tracked_tokens():
@@ -153,6 +173,14 @@ def send_discord_start_notification(
     create_time,
     token_link
 ):
+    if is_stock_symbol(token_name):
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"Ignoring stock ticker for Discord notification: {token_name}",
+            flush=True
+        )
+        return False
+
     if not DISCORD_WEBHOOK_URL:
         print(
             f"[{datetime.now(timezone.utc).isoformat()}] "
@@ -166,8 +194,7 @@ def send_discord_start_notification(
         "content": (
             f"🚨 **NEW MEXC FUTURES TOKEN**\n\n"
             f"**Token:** `{token_name}`\n"
-            f"**Initial Price:** `{initial_price}`\n"
-            f"**Created:** `{create_time.isoformat()}`\n\n"
+            f"**Created:** `{format_aest_time(create_time)}`\n\n"
             f"🔗 <{token_link}>\n\n"
             f"⏱️ Tracking for 8 hours..."
         )
@@ -206,6 +233,14 @@ def post_price_change(
     current_price,
     price_change
 ):
+    if is_stock_symbol(token_name):
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"Ignoring stock ticker for POST: {token_name}",
+            flush=True
+        )
+        return False
+
     if not POST_URL:
         print(
             f"[{datetime.now(timezone.utc).isoformat()}] "
@@ -254,6 +289,15 @@ def check_price_changes(tracked_tokens):
     to_remove = []
 
     for token_name, data in list(tracked_tokens.items()):
+
+        if is_stock_symbol(token_name):
+            print(
+                f"[{datetime.now(timezone.utc).isoformat()}] "
+                f"Ignoring stock ticker in tracking check: {token_name}",
+                flush=True
+            )
+            to_remove.append(token_name)
+            continue
 
         try:
             initial_time = datetime.fromisoformat(data["time"])
@@ -407,6 +451,14 @@ def find_new_tokens():
                     token_name = token.get("symbol")
 
                     if not token_name:
+                        continue
+
+                    if is_stock_symbol(token_name):
+                        print(
+                            f"[{datetime.now(timezone.utc).isoformat()}] "
+                            f"Ignoring stock ticker: {token_name}",
+                            flush=True
+                        )
                         continue
 
                     token_link = (
