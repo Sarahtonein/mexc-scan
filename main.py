@@ -33,6 +33,19 @@ def format_aest_time(value):
     return value.astimezone(AEST).strftime("%Y-%m-%d %H:%M:%S AEST")
 
 
+def is_divergence_monitor_active(tracked_at, current_time=None, window_hours=48):
+    if current_time is None:
+        current_time = datetime.now(timezone.utc)
+
+    if isinstance(tracked_at, str):
+        tracked_at = datetime.fromisoformat(tracked_at)
+
+    if tracked_at.tzinfo is None:
+        tracked_at = tracked_at.replace(tzinfo=timezone.utc)
+
+    return (current_time - tracked_at) < timedelta(hours=window_hours)
+
+
 def load_tracked_tokens():
     try:
         with open(TRACKED_TOKENS_FILE, "r") as file:
@@ -167,6 +180,147 @@ def get_token_price(symbol):
         return None
 
 
+def calculate_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return []
+
+    deltas = [
+        float(closes[i]) - float(closes[i - 1])
+        for i in range(1, len(closes))
+    ]
+
+    gains = [max(delta, 0.0) for delta in deltas]
+    losses = [abs(min(delta, 0.0)) for delta in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    rsi_values = [50.0]
+
+    for index in range(period, len(deltas)):
+        if avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+
+        rsi_values.append(rsi)
+
+        avg_gain = ((avg_gain * (period - 1)) + gains[index]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[index]) / period
+
+    if len(rsi_values) < len(closes):
+        while len(rsi_values) < len(closes):
+            rsi_values.append(rsi_values[-1])
+
+    return rsi_values[:len(closes)]
+
+
+def detect_bearish_divergence(prices, rsi_values):
+    if len(prices) < 6 or len(rsi_values) < 6:
+        return None
+
+    earlier_prices = prices[:-3]
+    later_prices = prices[-3:]
+    earlier_rsi = rsi_values[:-3]
+    later_rsi = rsi_values[-3:]
+
+    earlier_price_high = max(earlier_prices)
+    later_price_high = max(later_prices)
+    earlier_rsi_high = max(earlier_rsi)
+    later_rsi_high = max(later_rsi)
+
+    if later_price_high > earlier_price_high and later_rsi_high < earlier_rsi_high:
+        return "regular"
+
+    earlier_price_low = min(earlier_prices)
+    later_price_low = min(later_prices)
+    earlier_rsi_low = min(earlier_rsi)
+    later_rsi_low = min(later_rsi)
+
+    if later_price_low < earlier_price_low and later_rsi_low > earlier_rsi_low:
+        return "hidden"
+
+    return None
+
+
+def fetch_spot_klines(symbol, interval="15m", limit=200):
+    spot_url = "https://api.mexc.com/api/v3/klines"
+
+    try:
+        response = requests.get(
+            spot_url,
+            params={
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit,
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if not isinstance(data, list):
+            print(
+                f"[{datetime.now(timezone.utc).isoformat()}] "
+                f"Unexpected spot klines response for {symbol}: {data}",
+                flush=True,
+            )
+            return []
+
+        return data
+
+    except requests.RequestException as e:
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"Error fetching spot klines for {symbol}: {e}",
+            flush=True,
+        )
+        return []
+
+
+def check_spot_bearish_divergence(symbol, tracked_since=None, current_time=None):
+    if not symbol or is_stock_symbol(symbol):
+        return None
+
+    if tracked_since is not None and not is_divergence_monitor_active(
+        tracked_since,
+        current_time or datetime.now(timezone.utc),
+    ):
+        return None
+
+    candles = fetch_spot_klines(symbol)
+    if len(candles) < 30:
+        return None
+
+    closes = []
+    for candle in candles:
+        if not isinstance(candle, (list, tuple)) or len(candle) < 5:
+            continue
+        try:
+            closes.append(float(candle[4]))
+        except (TypeError, ValueError):
+            continue
+
+    if len(closes) < 30:
+        return None
+
+    rsi_values = calculate_rsi(closes, period=14)
+    if len(rsi_values) < 6:
+        return None
+
+    divergence = detect_bearish_divergence(closes, rsi_values)
+    if divergence is None:
+        return None
+
+    current_price = get_token_price(symbol)
+    if current_price is None:
+        current_price = closes[-1]
+
+    send_discord_bearish_divergence_alert(symbol, divergence, current_price)
+    return divergence
+
+
 def send_discord_start_notification(
     token_name,
     initial_price,
@@ -223,6 +377,53 @@ def send_discord_start_notification(
             f"Error sending Discord notification for "
             f"{token_name}: {e}",
             flush=True
+        )
+        return False
+
+
+def send_discord_bearish_divergence_alert(symbol, divergence_type, current_price):
+    if is_stock_symbol(symbol):
+        return False
+
+    if not DISCORD_WEBHOOK_URL:
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"DISCORD_WEBHOOK_URL is not configured. "
+            f"Skipping bearish divergence alert for {symbol}",
+            flush=True,
+        )
+        return False
+
+    label = divergence_type.upper() if divergence_type else "BEARISH"
+    message = {
+        "content": (
+            f"🚨 **SHORT SETUP: {label} DIVERGENCE**\n\n"
+            f"**Token:** `{symbol}`\n"
+            f"**Bias:** `Short`\n"
+            f"**Market:** `Spot + new futures listing`\n"
+            f"**Price:** `{current_price}`\n\n"
+            f"**Reason:** spot RSI bearish divergence detected on an asset that also recently listed on MEXC futures."
+        )
+    }
+
+    try:
+        response = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json=message,
+            timeout=15,
+        )
+        response.raise_for_status()
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"Discord bearish divergence alert sent for {symbol}",
+            flush=True,
+        )
+        return True
+    except requests.RequestException as e:
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"Error sending divergence alert for {symbol}: {e}",
+            flush=True,
         )
         return False
 
@@ -312,6 +513,23 @@ def check_price_changes(tracked_tokens):
 
             to_remove.append(token_name)
             continue
+
+        divergence_alerted = data.get("divergence_alerted", False)
+        if not divergence_alerted and is_divergence_monitor_active(
+            initial_time,
+            current_time,
+            window_hours=48,
+        ):
+            divergence = check_spot_bearish_divergence(token_name, initial_time, current_time)
+            if divergence:
+                data["divergence_alerted"] = True
+                data["divergence_signal"] = divergence
+                print(
+                    f"[{datetime.now(timezone.utc).isoformat()}] "
+                    f"Divergence signal {divergence} alert armed for {token_name}",
+                    flush=True,
+                )
+                save_tracked_tokens(tracked_tokens)
 
         if current_time >= initial_time + timedelta(hours=8):
 
@@ -475,6 +693,7 @@ def find_new_tokens():
                             tracked_tokens[token_name] = {
                                 "price": current_price,
                                 "time": current_time.isoformat(),
+                                "divergence_alerted": False,
                             }
 
                             print(
