@@ -217,29 +217,49 @@ def calculate_rsi(closes, period=14):
 
 
 def detect_bearish_divergence(prices, rsi_values):
-    if len(prices) < 6 or len(rsi_values) < 6:
+    if len(prices) < 10 or len(rsi_values) < 10:
         return None
 
-    earlier_prices = prices[:-3]
-    later_prices = prices[-3:]
-    earlier_rsi = rsi_values[:-3]
-    later_rsi = rsi_values[-3:]
+    def pivot_indexes(values, is_high):
+        pivots = []
+        for index in range(1, len(values) - 1):
+            current = values[index]
+            previous = values[index - 1]
+            next_value = values[index + 1]
 
-    earlier_price_high = max(earlier_prices)
-    later_price_high = max(later_prices)
-    earlier_rsi_high = max(earlier_rsi)
-    later_rsi_high = max(later_rsi)
+            if is_high:
+                if current >= previous and current >= next_value and (current > previous or current > next_value):
+                    pivots.append(index)
+            else:
+                if current <= previous and current <= next_value and (current < previous or current < next_value):
+                    pivots.append(index)
 
-    if later_price_high > earlier_price_high and later_rsi_high < earlier_rsi_high:
-        return "regular"
+        return pivots
 
-    earlier_price_low = min(earlier_prices)
-    later_price_low = min(later_prices)
-    earlier_rsi_low = min(earlier_rsi)
-    later_rsi_low = min(later_rsi)
+    price_highs = pivot_indexes(prices, True)
+    rsi_highs = pivot_indexes(rsi_values, True)
+    price_lows = pivot_indexes(prices, False)
+    rsi_lows = pivot_indexes(rsi_values, False)
 
-    if later_price_low < earlier_price_low and later_rsi_low > earlier_rsi_low:
-        return "hidden"
+    for earlier_high_index in price_highs:
+        for later_high_index in price_highs:
+            if later_high_index <= earlier_high_index:
+                continue
+            if prices[later_high_index] <= prices[earlier_high_index]:
+                continue
+            if rsi_values[later_high_index] >= rsi_values[earlier_high_index]:
+                continue
+            return "regular"
+
+    for earlier_low_index in price_lows:
+        for later_low_index in price_lows:
+            if later_low_index <= earlier_low_index:
+                continue
+            if prices[later_low_index] >= prices[earlier_low_index]:
+                continue
+            if rsi_values[later_low_index] <= rsi_values[earlier_low_index]:
+                continue
+            return "hidden"
 
     return None
 
