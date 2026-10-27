@@ -37,3 +37,34 @@ def test_divergence_monitor_window_ends_after_48_hours():
     started = now - __import__("datetime").timedelta(hours=48)
     assert main_module.is_divergence_monitor_active(started, now) is False
     assert main_module.is_divergence_monitor_active(started + __import__("datetime").timedelta(hours=47), now) is True
+
+
+def test_check_spot_bearish_divergence_sends_post_alert(monkeypatch):
+    prices = list(range(80, 107)) + [120, 130, 150]
+    candles = [[0, 0, 0, 0, price, 0] for price in prices]
+    rsi_values = [70 for _ in range(27)] + [60, 55, 50]
+
+    monkeypatch.setattr(main_module, "fetch_spot_klines", lambda symbol, interval="15m", limit=200: candles)
+    monkeypatch.setattr(main_module, "calculate_rsi", lambda closes, period=14: rsi_values)
+    monkeypatch.setattr(main_module, "get_token_price", lambda symbol: 150.0)
+    monkeypatch.setattr(main_module, "DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr(main_module, "POST_URL", "https://example.com/hook")
+
+    seen = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, json=None, timeout=15):
+        seen["url"] = url
+        seen["payload"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(main_module.requests, "post", fake_post)
+
+    assert main_module.check_spot_bearish_divergence("NEWCOIN") == "regular"
+    assert seen["payload"]["event"] == "bearish_divergence"
+    assert seen["payload"]["timeframe"] == "15m"

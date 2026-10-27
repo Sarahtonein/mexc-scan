@@ -289,7 +289,7 @@ def check_spot_bearish_divergence(symbol, tracked_since=None, current_time=None)
     ):
         return None
 
-    candles = fetch_spot_klines(symbol)
+    candles = fetch_spot_klines(symbol, interval="15m")
     if len(candles) < 30:
         return None
 
@@ -318,6 +318,7 @@ def check_spot_bearish_divergence(symbol, tracked_since=None, current_time=None)
         current_price = closes[-1]
 
     send_discord_bearish_divergence_alert(symbol, divergence, current_price)
+    send_divergence_post_notification(symbol, divergence, current_price, timeframe="15m")
     return divergence
 
 
@@ -423,6 +424,51 @@ def send_discord_bearish_divergence_alert(symbol, divergence_type, current_price
         print(
             f"[{datetime.now(timezone.utc).isoformat()}] "
             f"Error sending divergence alert for {symbol}: {e}",
+            flush=True,
+        )
+        return False
+
+
+def send_divergence_post_notification(symbol, divergence_type, current_price, timeframe="15m"):
+    if is_stock_symbol(symbol):
+        return False
+
+    if not POST_URL:
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"POST_URL is not configured. "
+            f"Skipping divergence POST alert for {symbol}",
+            flush=True,
+        )
+        return False
+
+    payload = {
+        "event": "bearish_divergence",
+        "token_name": symbol,
+        "divergence_type": divergence_type,
+        "timeframe": timeframe,
+        "direction": "short",
+        "current_price": current_price,
+        "market": "spot + new futures listing",
+    }
+
+    try:
+        response = requests.post(
+            POST_URL,
+            json=payload,
+            timeout=15,
+        )
+        response.raise_for_status()
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"Divergence POST alert sent for {symbol}",
+            flush=True,
+        )
+        return True
+    except requests.RequestException as e:
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"Error sending divergence POST alert for {symbol}: {e}",
             flush=True,
         )
         return False
