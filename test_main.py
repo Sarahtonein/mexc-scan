@@ -2,6 +2,8 @@ import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 spec = importlib.util.spec_from_file_location("main_module", Path(__file__).with_name("main.py"))
 main_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(main_module)
@@ -37,6 +39,44 @@ def test_divergence_monitor_window_ends_after_48_hours():
     started = now - __import__("datetime").timedelta(hours=48)
     assert main_module.is_divergence_monitor_active(started, now) is False
     assert main_module.is_divergence_monitor_active(started + __import__("datetime").timedelta(hours=47), now) is True
+
+
+def test_find_new_tokens_posts_new_token_event(monkeypatch):
+    seen = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, json=None, timeout=15):
+        seen["url"] = url
+        seen["payload"] = json
+        return FakeResponse()
+
+    def fake_sleep(_):
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(main_module, "load_tracked_tokens", lambda: {})
+    monkeypatch.setattr(
+        main_module,
+        "get_tokens",
+        lambda: [{"symbol": "NEWCOIN", "createTime": int(datetime.now(timezone.utc).timestamp() * 1000)}],
+    )
+    monkeypatch.setattr(main_module, "get_token_price", lambda symbol: 123.45)
+    monkeypatch.setattr(main_module, "save_tracked_tokens", lambda tokens: None)
+    monkeypatch.setattr(main_module, "send_discord_start_notification", lambda *args, **kwargs: True)
+    monkeypatch.setattr(main_module, "check_price_changes", lambda tracked_tokens: None)
+    monkeypatch.setattr(main_module, "POST_URL", "https://example.com/hook")
+    monkeypatch.setattr(main_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(main_module.requests, "post", fake_post)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        main_module.find_new_tokens()
+
+    assert seen["payload"]["event"] == "new_token"
+    assert seen["payload"]["token_name"] == "NEWCOIN"
 
 
 def test_check_spot_bearish_divergence_sends_post_alert(monkeypatch):

@@ -342,6 +342,60 @@ def check_spot_bearish_divergence(symbol, tracked_since=None, current_time=None)
     return divergence
 
 
+def send_new_token_post_notification(
+    token_name,
+    initial_price,
+    create_time,
+    token_link,
+):
+    if is_stock_symbol(token_name):
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"Ignoring stock ticker for new-token POST: {token_name}",
+            flush=True,
+        )
+        return False
+
+    if not POST_URL:
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"POST_URL is not configured. "
+            f"Skipping new-token POST for {token_name}",
+            flush=True,
+        )
+        return False
+
+    payload = {
+        "event": "new_token",
+        "token_name": token_name,
+        "initial_price": initial_price,
+        "created_at": create_time.isoformat(),
+        "token_link": token_link,
+        "market": "mexc_futures",
+    }
+
+    try:
+        response = requests.post(
+            POST_URL,
+            json=payload,
+            timeout=15,
+        )
+        response.raise_for_status()
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"New-token POST sent for {token_name}",
+            flush=True,
+        )
+        return True
+    except requests.RequestException as e:
+        print(
+            f"[{datetime.now(timezone.utc).isoformat()}] "
+            f"Error sending new-token POST for {token_name}: {e}",
+            flush=True,
+        )
+        return False
+
+
 def send_discord_start_notification(
     token_name,
     initial_price,
@@ -776,6 +830,13 @@ def find_new_tokens():
                             )
 
                             save_tracked_tokens(tracked_tokens)
+
+                            send_new_token_post_notification(
+                                token_name,
+                                current_price,
+                                create_time,
+                                token_link,
+                            )
 
                             send_discord_start_notification(
                                 token_name,
