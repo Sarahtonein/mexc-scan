@@ -1,23 +1,46 @@
+
 import requests
 import time
 import json
 import os
 from datetime import datetime, timedelta, timezone
 
-GET_URL = "https://contract.mexc.com/api/v1/contract/detail"
-PRICE_URL = "https://contract.mexc.com/api/v1/contract/ticker?symbol={}"
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MEXC_GET_URL = "https://contract.mexc.com/api/v1/contract/detail"
+MEXC_PRICE_URL = "https://contract.mexc.com/api/v1/contract/ticker?symbol={}"
+
+OURBIT_GET_URL = "https://futures.ourbit.com/api/v1/contract/detail"
+OURBIT_PRICE_URL = "https://futures.ourbit.com/api/v1/contract/ticker?symbol={}"
 
 POST_URL = os.getenv("POST_URL")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 TRACKED_TOKENS_FILE = "tracked_tokens.json"
+KNOWN_CONTRACTS_FILE = "known_contracts.json"
+
 AEST = timezone(timedelta(hours=10))
+
+POLL_INTERVAL = 25
+TRACKING_HOURS = 8
+DIVERGENCE_HOURS = 48
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def log(message):
+    print(
+        f"[{datetime.now(timezone.utc).isoformat()}] {message}",
+        flush=True
+    )
 
 
 def is_stock_symbol(symbol):
-    if not isinstance(symbol, str):
-        return False
-    return "STOCK" in symbol.upper()
+    return isinstance(symbol, str) and "STOCK" in symbol.upper()
 
 
 def format_aest_time(value):
@@ -33,7 +56,11 @@ def format_aest_time(value):
     return value.astimezone(AEST).strftime("%Y-%m-%d %H:%M:%S AEST")
 
 
-def is_divergence_monitor_active(tracked_at, current_time=None, window_hours=48):
+def is_divergence_monitor_active(
+    tracked_at,
+    current_time=None,
+    window_hours=48
+):
     if current_time is None:
         current_time = datetime.now(timezone.utc)
 
@@ -43,25 +70,23 @@ def is_divergence_monitor_active(tracked_at, current_time=None, window_hours=48)
     if tracked_at.tzinfo is None:
         tracked_at = tracked_at.replace(tzinfo=timezone.utc)
 
-    return (current_time - tracked_at) < timedelta(hours=window_hours)
+    return (
+        current_time - tracked_at
+    ) < timedelta(hours=window_hours)
 
+
+# ============================================================
+# FILE STORAGE
+# ============================================================
 
 def load_tracked_tokens():
     try:
         with open(TRACKED_TOKENS_FILE, "r") as file:
             content = file.read().strip()
-
-            if content:
-                return json.loads(content)
-
-            return {}
+            return json.loads(content) if content else {}
 
     except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Error loading tracked tokens: {e}",
-            flush=True
-        )
+        log(f"Error loading tracked tokens: {e}")
         return {}
 
 
@@ -71,114 +96,131 @@ def save_tracked_tokens(tokens):
             json.dump(tokens, file, indent=4)
 
     except Exception as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Error saving tokens to file: {e}",
-            flush=True
+        log(f"Error saving tracked tokens: {e}")
+
+
+def load_known_contracts():
+    try:
+        with open(KNOWN_CONTRACTS_FILE, "r") as file:
+            return json.load(file)
+
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"ourbit": []}
+
+
+def save_known_contracts(contracts):
+    try:
+        with open(KNOWN_CONTRACTS_FILE, "w") as file:
+            json.dump(contracts, file, indent=4)
+
+    except Exception as e:
+        log(f"Error saving known contracts: {e}")
+
+
+# ============================================================
+# EXCHANGE API
+# ============================================================
+
+def get_tokens(exchange):
+    urls = {
+        "mexc": MEXC_GET_URL,
+        "ourbit": OURBIT_GET_URL,
+    }
+
+    try:
+        response = requests.get(
+            urls[exchange],
+            timeout=15
         )
 
-
-def get_tokens():
-    try:
-        response = requests.get(GET_URL, timeout=15)
         response.raise_for_status()
-
         data = response.json()
 
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"MEXC response type: {type(data).__name__}",
-            flush=True
+        tokens = (
+            data.get("data", [])
+            if isinstance(data, dict)
+            else []
         )
 
-        if isinstance(data, dict):
-            print(
-                f"[{datetime.now(timezone.utc).isoformat()}] "
-                f"MEXC response keys: {list(data.keys())}",
-                flush=True
-            )
+        if not isinstance(tokens, list):
+            log(f"{exchange.upper()}: Unexpected contract response")
+            return []
 
-        tokens = data if isinstance(data, list) else data.get("data", [])
-
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Parsed {len(tokens)} tokens",
-            flush=True
+        log(
+            f"{exchange.upper()}: Retrieved "
+            f"{len(tokens)} contracts"
         )
 
         return tokens
 
-    except requests.RequestException as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Error fetching tokens: {e}",
-            flush=True
-        )
-        return []
-
     except Exception as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Unexpected error parsing MEXC response: {e}",
-            flush=True
-        )
+        log(f"{exchange.upper()} contract fetch error: {e}")
         return []
 
 
-def get_token_price(symbol):
+def get_token_price(symbol, exchange="mexc"):
+    urls = {
+        "mexc": MEXC_PRICE_URL.format(symbol),
+        "ourbit": OURBIT_PRICE_URL.format(symbol),
+    }
+
     try:
         response = requests.get(
-            PRICE_URL.format(symbol),
+            urls[exchange],
             timeout=15
         )
-        response.raise_for_status()
 
+        response.raise_for_status()
         data = response.json()
 
-        if isinstance(data, dict):
-            ticker_data = data.get("data", data)
+        ticker = (
+            data.get("data", data)
+            if isinstance(data, dict)
+            else {}
+        )
 
-            if isinstance(ticker_data, dict):
-                price = ticker_data.get("lastPrice")
-            else:
-                price = None
-        else:
-            price = None
+        if isinstance(ticker, list):
+            ticker = ticker[0] if ticker else {}
+
+        if not isinstance(ticker, dict):
+            return None
+
+        price = (
+            ticker.get("lastPrice")
+            or ticker.get("last")
+            or ticker.get("price")
+        )
 
         if price is None:
-            print(
-                f"[{datetime.now(timezone.utc).isoformat()}] "
-                f"No price returned for {symbol}: {data}",
-                flush=True
+            log(
+                f"{exchange.upper()}: No price for "
+                f"{symbol}: {data}"
             )
             return None
 
         return float(price)
 
-    except requests.RequestException as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Error fetching price for {symbol}: {e}",
-            flush=True
-        )
-        return None
-
-    except (ValueError, TypeError) as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Invalid price for {symbol}: {e}",
-            flush=True
-        )
-        return None
-
     except Exception as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Unexpected price error for {symbol}: {e}",
-            flush=True
+        log(
+            f"{exchange.upper()} price error "
+            f"for {symbol}: {e}"
         )
         return None
 
+
+def get_contract_link(exchange, symbol):
+    if exchange == "ourbit":
+        return f"https://www.ourbit.com/futures/{symbol}"
+
+    return (
+        f"https://futures.mexc.com/exchange/"
+        f"{symbol}?type=linear_swap"
+    )
+
+
+# ============================================================
+# RSI
+# ============================================================
 
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -198,6 +240,7 @@ def calculate_rsi(closes, period=14):
     rsi_values = [50.0]
 
     for index in range(period, len(deltas)):
+
         if avg_loss == 0:
             rsi = 100.0
         else:
@@ -206,12 +249,16 @@ def calculate_rsi(closes, period=14):
 
         rsi_values.append(rsi)
 
-        avg_gain = ((avg_gain * (period - 1)) + gains[index]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[index]) / period
+        avg_gain = (
+            (avg_gain * (period - 1)) + gains[index]
+        ) / period
 
-    if len(rsi_values) < len(closes):
-        while len(rsi_values) < len(closes):
-            rsi_values.append(rsi_values[-1])
+        avg_loss = (
+            (avg_loss * (period - 1)) + losses[index]
+        ) / period
+
+    while len(rsi_values) < len(closes):
+        rsi_values.append(rsi_values[-1])
 
     return rsi_values[:len(closes)]
 
@@ -222,47 +269,76 @@ def detect_bearish_divergence(prices, rsi_values):
 
     def pivot_indexes(values, is_high):
         pivots = []
+
         for index in range(1, len(values) - 1):
             current = values[index]
             previous = values[index - 1]
             next_value = values[index + 1]
 
             if is_high:
-                if current >= previous and current >= next_value and (current > previous or current > next_value):
+                if (
+                    current >= previous
+                    and current >= next_value
+                    and (
+                        current > previous
+                        or current > next_value
+                    )
+                ):
                     pivots.append(index)
+
             else:
-                if current <= previous and current <= next_value and (current < previous or current < next_value):
+                if (
+                    current <= previous
+                    and current <= next_value
+                    and (
+                        current < previous
+                        or current < next_value
+                    )
+                ):
                     pivots.append(index)
 
         return pivots
 
     price_highs = pivot_indexes(prices, True)
     rsi_highs = pivot_indexes(rsi_values, True)
+
     price_lows = pivot_indexes(prices, False)
     rsi_lows = pivot_indexes(rsi_values, False)
 
-    for earlier_high_index in price_highs:
-        for later_high_index in price_highs:
-            if later_high_index <= earlier_high_index:
+    for earlier in price_highs:
+        for later in price_highs:
+
+            if later <= earlier:
                 continue
-            if prices[later_high_index] <= prices[earlier_high_index]:
+
+            if prices[later] <= prices[earlier]:
                 continue
-            if rsi_values[later_high_index] >= rsi_values[earlier_high_index]:
+
+            if rsi_values[later] >= rsi_values[earlier]:
                 continue
+
             return "regular"
 
-    for earlier_low_index in price_lows:
-        for later_low_index in price_lows:
-            if later_low_index <= earlier_low_index:
+    for earlier in price_lows:
+        for later in price_lows:
+
+            if later <= earlier:
                 continue
-            if prices[later_low_index] >= prices[earlier_low_index]:
+
+            if prices[later] >= prices[earlier]:
                 continue
-            if rsi_values[later_low_index] <= rsi_values[earlier_low_index]:
+
+            if rsi_values[later] <= rsi_values[earlier]:
                 continue
+
             return "hidden"
 
     return None
 
+
+# ============================================================
+# MEXC SPOT KLINES / DIVERGENCE
+# ============================================================
 
 def fetch_spot_klines(symbol, interval="15m", limit=200):
     spot_url = "https://api.mexc.com/api/v3/klines"
@@ -277,46 +353,44 @@ def fetch_spot_klines(symbol, interval="15m", limit=200):
             },
             timeout=15,
         )
+
         response.raise_for_status()
         data = response.json()
 
-        if not isinstance(data, list):
-            print(
-                f"[{datetime.now(timezone.utc).isoformat()}] "
-                f"Unexpected spot klines response for {symbol}: {data}",
-                flush=True,
-            )
-            return []
+        return data if isinstance(data, list) else []
 
-        return data
-
-    except requests.RequestException as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Error fetching spot klines for {symbol}: {e}",
-            flush=True,
-        )
+    except Exception as e:
+        log(f"Spot klines error for {symbol}: {e}")
         return []
 
 
-def check_spot_bearish_divergence(symbol, tracked_since=None, current_time=None):
+def check_spot_bearish_divergence(
+    symbol,
+    tracked_since=None,
+    current_time=None
+):
     if not symbol or is_stock_symbol(symbol):
         return None
 
-    if tracked_since is not None and not is_divergence_monitor_active(
-        tracked_since,
-        current_time or datetime.now(timezone.utc),
-    ):
-        return None
+    if tracked_since is not None:
+        if not is_divergence_monitor_active(
+            tracked_since,
+            current_time or datetime.now(timezone.utc),
+            DIVERGENCE_HOURS,
+        ):
+            return None
 
     candles = fetch_spot_klines(symbol, interval="15m")
+
     if len(candles) < 30:
         return None
 
     closes = []
+
     for candle in candles:
         if not isinstance(candle, (list, tuple)) or len(candle) < 5:
             continue
+
         try:
             closes.append(float(candle[4]))
         except (TypeError, ValueError):
@@ -326,43 +400,55 @@ def check_spot_bearish_divergence(symbol, tracked_since=None, current_time=None)
         return None
 
     rsi_values = calculate_rsi(closes, period=14)
+
     if len(rsi_values) < 6:
         return None
 
-    divergence = detect_bearish_divergence(closes, rsi_values)
+    divergence = detect_bearish_divergence(
+        closes,
+        rsi_values
+    )
+
     if divergence is None:
         return None
 
-    current_price = get_token_price(symbol)
+    current_price = get_token_price(symbol, "mexc")
+
     if current_price is None:
         current_price = closes[-1]
 
-    send_discord_bearish_divergence_alert(symbol, divergence, current_price)
-    send_divergence_post_notification(symbol, divergence, current_price, timeframe="15m")
+    send_discord_bearish_divergence_alert(
+        symbol,
+        divergence,
+        current_price
+    )
+
+    send_divergence_post_notification(
+        symbol,
+        divergence,
+        current_price,
+        timeframe="15m"
+    )
+
     return divergence
 
+
+# ============================================================
+# NEW TOKEN POST NOTIFICATION
+# ============================================================
 
 def send_new_token_post_notification(
     token_name,
     initial_price,
     create_time,
     token_link,
+    exchange="mexc",
 ):
     if is_stock_symbol(token_name):
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Ignoring stock ticker for new-token POST: {token_name}",
-            flush=True,
-        )
         return False
 
     if not POST_URL:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"POST_URL is not configured. "
-            f"Skipping new-token POST for {token_name}",
-            flush=True,
-        )
+        log("POST_URL not configured. Skipping notification.")
         return False
 
     payload = {
@@ -371,7 +457,8 @@ def send_new_token_post_notification(
         "initial_price": initial_price,
         "created_at": create_time.isoformat(),
         "token_link": token_link,
-        "market": "mexc_futures",
+        "market": f"{exchange}_futures",
+        "exchange": exchange,
     }
 
     try:
@@ -380,104 +467,49 @@ def send_new_token_post_notification(
             json=payload,
             timeout=15,
         )
+
         response.raise_for_status()
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"New-token POST sent for {token_name}",
-            flush=True,
+
+        log(
+            f"{exchange.upper()} new-token POST sent "
+            f"for {token_name}"
         )
+
         return True
-    except requests.RequestException as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Error sending new-token POST for {token_name}: {e}",
-            flush=True,
-        )
+
+    except Exception as e:
+        log(f"New-token POST error for {token_name}: {e}")
         return False
 
+
+# ============================================================
+# DISCORD NEW TOKEN NOTIFICATION
+# ============================================================
 
 def send_discord_start_notification(
     token_name,
     initial_price,
     create_time,
-    token_link
+    token_link,
+    exchange="mexc",
 ):
     if is_stock_symbol(token_name):
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Ignoring stock ticker for Discord notification: {token_name}",
-            flush=True
-        )
         return False
 
     if not DISCORD_WEBHOOK_URL:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"DISCORD_WEBHOOK_URL is not configured. "
-            f"Skipping Discord notification.",
-            flush=True
-        )
+        log("DISCORD_WEBHOOK_URL not configured.")
         return False
 
     message = {
         "content": (
-            f"🚨 **NEW MEXC FUTURES TOKEN**\n\n"
+            f"🚨 **NEW {exchange.upper()} FUTURES TOKEN**\n\n"
             f"**Token:** `{token_name}`\n"
-            f"**Created:** `{format_aest_time(create_time)}`\n\n"
+            f"**Exchange:** `{exchange.upper()}`\n"
+            f"**Initial Price:** `{initial_price}`\n"
+            f"**Created / Detected:** "
+            f"`{format_aest_time(create_time)}`\n\n"
             f"🔗 <{token_link}>\n\n"
-            f"⏱️ Tracking for 8 hours..."
-        )
-    }
-
-    try:
-        response = requests.post(
-            DISCORD_WEBHOOK_URL,
-            json=message,
-            timeout=15
-        )
-
-        response.raise_for_status()
-
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Discord notification sent for {token_name}",
-            flush=True
-        )
-
-        return True
-
-    except requests.RequestException as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Error sending Discord notification for "
-            f"{token_name}: {e}",
-            flush=True
-        )
-        return False
-
-
-def send_discord_bearish_divergence_alert(symbol, divergence_type, current_price):
-    if is_stock_symbol(symbol):
-        return False
-
-    if not DISCORD_WEBHOOK_URL:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"DISCORD_WEBHOOK_URL is not configured. "
-            f"Skipping bearish divergence alert for {symbol}",
-            flush=True,
-        )
-        return False
-
-    label = divergence_type.upper() if divergence_type else "BEARISH"
-    message = {
-        "content": (
-            f"🚨 **SHORT SETUP: {label} DIVERGENCE**\n\n"
-            f"**Token:** `{symbol}`\n"
-            f"**Bias:** `Short`\n"
-            f"**Market:** `Spot + new futures listing`\n"
-            f"**Price:** `{current_price}`\n\n"
-            f"**Reason:** spot RSI bearish divergence detected on an asset that also recently listed on MEXC futures."
+            f"⏱️ Tracking for {TRACKING_HOURS} hours..."
         )
     }
 
@@ -487,33 +519,85 @@ def send_discord_bearish_divergence_alert(symbol, divergence_type, current_price
             json=message,
             timeout=15,
         )
+
         response.raise_for_status()
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Discord bearish divergence alert sent for {symbol}",
-            flush=True,
+
+        log(
+            f"Discord notification sent for "
+            f"{exchange.upper()} {token_name}"
         )
+
         return True
-    except requests.RequestException as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Error sending divergence alert for {symbol}: {e}",
-            flush=True,
-        )
+
+    except Exception as e:
+        log(f"Discord notification error: {e}")
         return False
 
 
-def send_divergence_post_notification(symbol, divergence_type, current_price, timeframe="15m"):
+# ============================================================
+# DISCORD DIVERGENCE ALERT
+# ============================================================
+
+def send_discord_bearish_divergence_alert(
+    symbol,
+    divergence_type,
+    current_price
+):
+    if is_stock_symbol(symbol):
+        return False
+
+    if not DISCORD_WEBHOOK_URL:
+        return False
+
+    label = (
+        divergence_type.upper()
+        if divergence_type
+        else "BEARISH"
+    )
+
+    message = {
+        "content": (
+            f"🚨 **SHORT SETUP: {label} DIVERGENCE**\n\n"
+            f"**Token:** `{symbol}`\n"
+            f"**Bias:** `Short`\n"
+            f"**Market:** `MEXC Spot + Futures`\n"
+            f"**Price:** `{current_price}`\n\n"
+            f"**Reason:** Spot RSI bearish divergence detected "
+            f"on an asset that recently listed on MEXC futures."
+        )
+    }
+
+    try:
+        response = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json=message,
+            timeout=15,
+        )
+
+        response.raise_for_status()
+
+        log(f"Discord divergence alert sent for {symbol}")
+        return True
+
+    except Exception as e:
+        log(f"Divergence Discord error: {e}")
+        return False
+
+
+# ============================================================
+# DIVERGENCE POST
+# ============================================================
+
+def send_divergence_post_notification(
+    symbol,
+    divergence_type,
+    current_price,
+    timeframe="15m"
+):
     if is_stock_symbol(symbol):
         return False
 
     if not POST_URL:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"POST_URL is not configured. "
-            f"Skipping divergence POST alert for {symbol}",
-            flush=True,
-        )
         return False
 
     payload = {
@@ -524,6 +608,7 @@ def send_divergence_post_notification(symbol, divergence_type, current_price, ti
         "direction": "short",
         "current_price": current_price,
         "market": "spot + new futures listing",
+        "exchange": "mexc",
     }
 
     try:
@@ -532,43 +617,32 @@ def send_divergence_post_notification(symbol, divergence_type, current_price, ti
             json=payload,
             timeout=15,
         )
+
         response.raise_for_status()
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Divergence POST alert sent for {symbol}",
-            flush=True,
-        )
+
+        log(f"Divergence POST sent for {symbol}")
         return True
-    except requests.RequestException as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Error sending divergence POST alert for {symbol}: {e}",
-            flush=True,
-        )
+
+    except Exception as e:
+        log(f"Divergence POST error: {e}")
         return False
 
+
+# ============================================================
+# 8-HOUR PRICE CHANGE POST
+# ============================================================
 
 def post_price_change(
     token_name,
     initial_price,
     current_price,
-    price_change
+    price_change,
+    exchange="mexc",
 ):
     if is_stock_symbol(token_name):
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Ignoring stock ticker for POST: {token_name}",
-            flush=True
-        )
         return False
 
     if not POST_URL:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"POST_URL is not configured. "
-            f"Skipping POST for {token_name}",
-            flush=True
-        )
         return False
 
     payload = {
@@ -576,318 +650,406 @@ def post_price_change(
         "initial_price": initial_price,
         "current_price": current_price,
         "price_change": price_change,
+        "exchange": exchange,
+        "market": f"{exchange}_futures",
     }
 
     try:
         response = requests.post(
             POST_URL,
             json=payload,
-            timeout=15
+            timeout=15,
         )
 
         response.raise_for_status()
 
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"POST successful for {token_name}: "
-            f"{response.status_code}",
-            flush=True
+        log(
+            f"{exchange.upper()} price-change POST successful "
+            f"for {token_name}"
         )
 
         return True
 
-    except requests.RequestException as e:
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Error sending POST request for {token_name}: {e}",
-            flush=True
-        )
+    except Exception as e:
+        log(f"Price-change POST error for {token_name}: {e}")
         return False
 
+
+# ============================================================
+# CHECK TRACKED TOKENS
+# ============================================================
 
 def check_price_changes(tracked_tokens):
     current_time = datetime.now(timezone.utc)
     to_remove = []
 
-    for token_name, data in list(tracked_tokens.items()):
+    for tracking_key, data in list(tracked_tokens.items()):
+
+        exchange = data.get("exchange", "mexc")
+        token_name = data.get("symbol", tracking_key)
 
         if is_stock_symbol(token_name):
-            print(
-                f"[{datetime.now(timezone.utc).isoformat()}] "
-                f"Ignoring stock ticker in tracking check: {token_name}",
-                flush=True
-            )
-            to_remove.append(token_name)
+            to_remove.append(tracking_key)
             continue
 
         try:
             initial_time = datetime.fromisoformat(data["time"])
 
         except (KeyError, ValueError, TypeError) as e:
-
-            print(
-                f"[{datetime.now(timezone.utc).isoformat()}] "
-                f"Invalid tracking data for {token_name}: {e}",
-                flush=True
-            )
-
-            to_remove.append(token_name)
+            log(f"Invalid tracking data for {tracking_key}: {e}")
+            to_remove.append(tracking_key)
             continue
 
-        divergence_alerted = data.get("divergence_alerted", False)
-        if not divergence_alerted and is_divergence_monitor_active(
-            initial_time,
-            current_time,
-            window_hours=48,
-        ):
-            divergence = check_spot_bearish_divergence(token_name, initial_time, current_time)
-            if divergence:
-                data["divergence_alerted"] = True
-                data["divergence_signal"] = divergence
-                print(
-                    f"[{datetime.now(timezone.utc).isoformat()}] "
-                    f"Divergence signal {divergence} alert armed for {token_name}",
-                    flush=True,
-                )
-                save_tracked_tokens(tracked_tokens)
+        # MEXC spot divergence monitoring only.
+        if exchange == "mexc":
 
-        if current_time >= initial_time + timedelta(hours=8):
+            divergence_alerted = data.get(
+                "divergence_alerted",
+                False
+            )
+
+            if (
+                not divergence_alerted
+                and is_divergence_monitor_active(
+                    initial_time,
+                    current_time,
+                    DIVERGENCE_HOURS,
+                )
+            ):
+
+                divergence = check_spot_bearish_divergence(
+                    token_name,
+                    initial_time,
+                    current_time
+                )
+
+                if divergence:
+
+                    data["divergence_alerted"] = True
+                    data["divergence_signal"] = divergence
+
+                    save_tracked_tokens(tracked_tokens)
+
+                    log(
+                        f"Divergence {divergence} detected "
+                        f"for {token_name}"
+                    )
+
+        # 8-hour price tracking.
+        if current_time >= initial_time + timedelta(
+            hours=TRACKING_HOURS
+        ):
 
             initial_price = data.get("price")
 
             if not initial_price:
-
-                print(
-                    f"[{datetime.now(timezone.utc).isoformat()}] "
-                    f"Invalid initial price for {token_name}",
-                    flush=True
-                )
-
-                to_remove.append(token_name)
+                to_remove.append(tracking_key)
                 continue
 
-            current_price = get_token_price(token_name)
-
-            if current_price is not None:
-
-                price_change = (
-                    (current_price - initial_price)
-                    / initial_price
-                ) * 100
-
-                print(
-                    f"[{datetime.now(timezone.utc).isoformat()}] "
-                    f"8-hour result: "
-                    f"{token_name} | "
-                    f"Initial: {initial_price} | "
-                    f"Current: {current_price} | "
-                    f"Change: {price_change:.2f}%",
-                    flush=True
-                )
-
-                success = post_price_change(
-                    token_name,
-                    initial_price,
-                    current_price,
-                    price_change
-                )
-
-                if success:
-                    to_remove.append(token_name)
-
-    for token_name in to_remove:
-
-        if token_name in tracked_tokens:
-
-            del tracked_tokens[token_name]
-
-            print(
-                f"[{datetime.now(timezone.utc).isoformat()}] "
-                f"Removed completed token: {token_name}",
-                flush=True
+            current_price = get_token_price(
+                token_name,
+                exchange
             )
+
+            if current_price is None:
+                continue
+
+            price_change = (
+                (current_price - initial_price)
+                / initial_price
+            ) * 100
+
+            log(
+                f"{exchange.upper()} 8-hour result: "
+                f"{token_name} | "
+                f"Initial: {initial_price} | "
+                f"Current: {current_price} | "
+                f"Change: {price_change:.2f}%"
+            )
+
+            success = post_price_change(
+                token_name,
+                initial_price,
+                current_price,
+                price_change,
+                exchange,
+            )
+
+            if success:
+                to_remove.append(tracking_key)
+
+    for tracking_key in to_remove:
+        tracked_tokens.pop(tracking_key, None)
+
+        log(f"Removed completed token: {tracking_key}")
 
     if to_remove:
         save_tracked_tokens(tracked_tokens)
 
 
+# ============================================================
+# MAIN EXCHANGE MONITOR
+# ============================================================
+
 def find_new_tokens():
 
     tracked_tokens = load_tracked_tokens()
+    known_contracts = load_known_contracts()
 
-    print(
-        f"[{datetime.now(timezone.utc).isoformat()}] "
-        f"Loaded {len(tracked_tokens)} tracked tokens",
-        flush=True
+    log(
+        f"Loaded {len(tracked_tokens)} tracked tokens"
     )
 
-    while True:
+    # --------------------------------------------------------
+    # OURBIT INITIAL BASELINE
+    # --------------------------------------------------------
+    # Existing Ourbit contracts are recorded without alerts.
+    # Subsequent newly appearing symbols trigger notifications.
 
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Starting new iteration",
-            flush=True
-        )
+    if "ourbit" not in known_contracts:
 
-        tokens = get_tokens()
+        ourbit_tokens = get_tokens("ourbit")
 
-        if not tokens:
+        if ourbit_tokens:
 
-            print(
-                f"[{datetime.now(timezone.utc).isoformat()}] "
-                f"MEXC returned no tokens",
-                flush=True
+            known_contracts["ourbit"] = [
+                token["symbol"]
+                for token in ourbit_tokens
+                if (
+                    isinstance(token, dict)
+                    and token.get("symbol")
+                )
+            ]
+
+            save_known_contracts(known_contracts)
+
+            log(
+                f"OURBIT baseline established: "
+                f"{len(known_contracts['ourbit'])} contracts"
             )
 
         else:
+            log(
+                "OURBIT baseline unavailable. "
+                "Will retry next iteration."
+            )
 
-            current_time = datetime.now(timezone.utc)
-            one_hour_ago = current_time - timedelta(hours=1)
+    # --------------------------------------------------------
+    # MAIN LOOP
+    # --------------------------------------------------------
+
+    while True:
+
+        current_time = datetime.now(timezone.utc)
+
+        log("Starting exchange monitoring iteration")
+
+        # Process both exchanges independently.
+        for exchange in ("mexc", "ourbit"):
+
+            tokens = get_tokens(exchange)
+
+            if not tokens:
+                log(
+                    f"{exchange.upper()} returned no contracts. "
+                    f"Skipping this iteration."
+                )
+                continue
 
             new_tokens_found = 0
-            recently_created = 0
+
+            # Existing Ourbit symbols are stored persistently.
+            known = set(
+                known_contracts.get(exchange, [])
+            )
 
             for token in tokens:
 
                 if not isinstance(token, dict):
-
-                    print(
-                        f"Unexpected token format: {token}",
-                        flush=True
-                    )
                     continue
 
-                create_time_ms = token.get("createTime", 0)
+                token_name = token.get("symbol")
 
-                if not create_time_ms:
+                if not token_name:
                     continue
 
-                try:
-
-                    create_time = datetime.fromtimestamp(
-                        create_time_ms / 1000,
-                        timezone.utc
-                    )
-
-                except (
-                    ValueError,
-                    TypeError,
-                    OverflowError
-                ) as e:
-
-                    print(
-                        f"[{datetime.now(timezone.utc).isoformat()}] "
-                        f"Invalid createTime: {e}",
-                        flush=True
-                    )
+                if is_stock_symbol(token_name):
                     continue
 
-                if create_time >= one_hour_ago:
+                tracking_key = f"{exchange}:{token_name}"
 
-                    recently_created += 1
+                # ------------------------------------------------
+                # MEXC DETECTION
+                # ------------------------------------------------
 
-                    token_name = token.get("symbol")
+                if exchange == "mexc":
 
-                    if not token_name:
+                    create_time_ms = token.get(
+                        "createTime",
+                        0
+                    )
+
+                    if not create_time_ms:
                         continue
 
-                    if is_stock_symbol(token_name):
-                        print(
-                            f"[{datetime.now(timezone.utc).isoformat()}] "
-                            f"Ignoring stock ticker: {token_name}",
-                            flush=True
+                    try:
+                        create_time = datetime.fromtimestamp(
+                            create_time_ms / 1000,
+                            timezone.utc
                         )
+
+                    except (
+                        ValueError,
+                        TypeError,
+                        OverflowError
+                    ):
                         continue
 
-                    token_link = (
-                        "https://futures.mexc.com/exchange/"
-                        f"{token_name}?type=linear_swap"
+                    one_hour_ago = (
+                        current_time - timedelta(hours=1)
                     )
 
-                    if token_name not in tracked_tokens:
+                    if create_time < one_hour_ago:
+                        continue
 
-                        current_price = get_token_price(token_name)
+                # ------------------------------------------------
+                # OURBIT DETECTION
+                # ------------------------------------------------
 
-                        if current_price is not None:
+                else:
 
-                            tracked_tokens[token_name] = {
-                                "price": current_price,
-                                "time": current_time.isoformat(),
-                                "divergence_alerted": False,
-                            }
+                    # Ignore contracts already seen.
+                    if token_name in known:
+                        continue
 
-                            print(
-                                f"[{datetime.now(timezone.utc).isoformat()}] "
-                                f"🚨 Tracking new token: "
-                                f"{token_name} "
-                                f"at price {current_price}",
-                                flush=True
-                            )
+                    # Ourbit detection timestamp.
+                    # This is when our monitor first detects it,
+                    # not necessarily the actual listing time.
+                    create_time = current_time
 
-                            print(
-                                f"Token link: {token_link}",
-                                flush=True
-                            )
+                # ------------------------------------------------
+                # DUPLICATE TRACKING CHECK
+                # ------------------------------------------------
 
-                            save_tracked_tokens(tracked_tokens)
+                if tracking_key in tracked_tokens:
 
-                            send_new_token_post_notification(
-                                token_name,
-                                current_price,
-                                create_time,
-                                token_link,
-                            )
+                    known.add(token_name)
+                    continue
 
-                            send_discord_start_notification(
-                                token_name,
-                                current_price,
-                                create_time,
-                                token_link
-                            )
+                # ------------------------------------------------
+                # INITIAL PRICE
+                # ------------------------------------------------
 
-                            new_tokens_found += 1
+                current_price = get_token_price(
+                    token_name,
+                    exchange
+                )
 
-            print(
-                f"[{datetime.now(timezone.utc).isoformat()}] "
-                f"Recently created tokens "
-                f"(last hour): {recently_created}",
-                flush=True
+                if current_price is None:
+                    log(
+                        f"Unable to obtain initial price for "
+                        f"{exchange.upper()} {token_name}. "
+                        f"Will retry."
+                    )
+                    continue
+
+                token_link = get_contract_link(
+                    exchange,
+                    token_name
+                )
+
+                # ------------------------------------------------
+                # SAVE TOKEN
+                # ------------------------------------------------
+
+                tracked_tokens[tracking_key] = {
+                    "exchange": exchange,
+                    "symbol": token_name,
+                    "price": current_price,
+                    "time": current_time.isoformat(),
+                    "divergence_alerted": False,
+                }
+
+                known.add(token_name)
+
+                log(
+                    f"🚨 NEW {exchange.upper()} FUTURES TOKEN: "
+                    f"{token_name} @ {current_price}"
+                )
+
+                log(f"Token link: {token_link}")
+
+                save_tracked_tokens(tracked_tokens)
+
+                # ------------------------------------------------
+                # POST NOTIFICATION
+                # ------------------------------------------------
+
+                send_new_token_post_notification(
+                    token_name,
+                    current_price,
+                    create_time,
+                    token_link,
+                    exchange,
+                )
+
+                # ------------------------------------------------
+                # DISCORD NOTIFICATION
+                # ------------------------------------------------
+
+                send_discord_start_notification(
+                    token_name,
+                    current_price,
+                    create_time,
+                    token_link,
+                    exchange,
+                )
+
+                new_tokens_found += 1
+
+            # ----------------------------------------------------
+            # SAVE OURBIT CONTRACT HISTORY
+            # ----------------------------------------------------
+
+            if exchange == "ourbit":
+                known_contracts["ourbit"] = sorted(known)
+                save_known_contracts(known_contracts)
+
+            log(
+                f"{exchange.upper()}: "
+                f"Found {new_tokens_found} new contract(s)"
             )
 
-            if new_tokens_found == 0:
-
-                print(
-                    f"[{datetime.now(timezone.utc).isoformat()}] "
-                    f"No new tokens found",
-                    flush=True
-                )
-
-            else:
-
-                print(
-                    f"[{datetime.now(timezone.utc).isoformat()}] "
-                    f"Found and tracking "
-                    f"{new_tokens_found} new token(s)",
-                    flush=True
-                )
+        # --------------------------------------------------------
+        # CHECK EXISTING TRACKED TOKENS
+        # --------------------------------------------------------
 
         check_price_changes(tracked_tokens)
 
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
+        log(
             f"Currently tracking "
-            f"{len(tracked_tokens)} token(s)",
-            flush=True
+            f"{len(tracked_tokens)} contract(s)"
         )
 
-        print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Sleeping for 25 seconds...",
-            flush=True
-        )
+        log(f"Sleeping for {POLL_INTERVAL} seconds...")
 
-        time.sleep(25)
+        time.sleep(POLL_INTERVAL)
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
-    find_new_tokens()
+
+    log("Starting MEXC + OURBIT Futures Monitor")
+
+    try:
+        find_new_tokens()
+
+    except KeyboardInterrupt:
+        log("Monitor stopped manually.")
+
+    except Exception as e:
+        log(f"Fatal monitor error: {e}")
+        raise
